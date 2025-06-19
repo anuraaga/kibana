@@ -5,6 +5,7 @@
  * 2.0.
  */
 
+import { createClient, PhoenixClient } from '@arizeai/phoenix-client';
 import { isSupportedConnectorType } from '@kbn/inference-common';
 import {
   BufferFlushEvent,
@@ -48,6 +49,7 @@ import { format, parse, UrlObject } from 'url';
 import { inspect } from 'util';
 import type { ObservabilityAIAssistantAPIClientRequestParamsOf } from '@kbn/observability-ai-assistant-plugin/public';
 import { EvaluationResult } from './types';
+import { getSpans } from './vendor/getSpans';
 
 // eslint-disable-next-line spaced-comment
 /// <reference types="@kbn/ambient-ftr-types"/>
@@ -86,6 +88,7 @@ export interface ChatClient {
 
 export class KibanaClient {
   axios: AxiosInstance;
+  phoenix: PhoenixClient;
   constructor(
     private readonly log: ToolingLog,
     private readonly url: string,
@@ -97,6 +100,7 @@ export class KibanaClient {
         'x-elastic-internal-origin': 'kibana',
       },
     });
+    this.phoenix = createClient();
   }
 
   private getUrl(props: { query?: UrlObject['query']; pathname: string; ignoreSpaceId?: boolean }) {
@@ -519,6 +523,98 @@ export class KibanaClient {
         };
       },
       evaluate: async ({ messages, conversationId, errors }, criteria) => {
+        // Wait a bit for spans to export / index and get most recent one.
+        // A more robust solution would create traces here so the trace can
+        // be waited for. It would need Kibana to instrument ingress.
+
+        await new Promise((resolve) => setTimeout(resolve, 10000));
+
+        const { spans } = await getSpans({
+          client: that.phoenix,
+          project: { projectName: 'default' },
+        });
+
+        const span = spans.find((s) => s.span_kind === 'LLM');
+        const traceMessages: InnerMessage[] = [];
+        if (span) {
+          that.log.info(`Found LLM span: ${span.attributes}`);
+          const inputMessages: any[] = [];
+          const outputMessages: any[] = [];
+          for (const [key, value] of Object.entries(span.attributes!)) {
+            if (key.startsWith('llm.input_messages.')) {
+              const remaining = key.slice('llm.input_messages.'.length);
+              const dotIdx = remaining.indexOf('.');
+              const indexStr = remaining.slice(0, dotIdx);
+              const rest = remaining.slice(dotIdx + 1);
+              const index = Number.parseInt(indexStr, 10);
+              let realKey: string;
+              if (rest.startsWith('message.')) {
+                realKey = rest.slice('message.'.length);
+              } else {
+                realKey = rest;
+              }
+              if (realKey.startsWith('tool_calls.0')) {
+                realKey = realKey.slice('tool_calls.0.'.length);
+                switch (realKey) {
+                  case 'function.arguments':
+                    realKey = 'arguments';
+                    break;
+                  case 'function.name':
+                    realKey = 'name';
+                    break;
+                  default:
+                    continue;
+                }
+                if (!inputMessages[index]) {
+                  inputMessages[index] = {};
+                }
+                if (!inputMessages[index].function_call) {
+                  inputMessages[index].function_call = {
+                    trigger: 'assistant',
+                  };
+                }
+                inputMessages[index].function_call = {
+                  ...inputMessages[index].function_call,
+                  [realKey]: value,
+                };
+                continue;
+              }
+              inputMessages[index] = {
+                ...inputMessages[index],
+                [realKey]: value,
+              };
+            }
+            if (key.startsWith('llm.output_messages.')) {
+              const remaining = key.slice('llm.output_messages.'.length);
+              const dotIdx = remaining.indexOf('.');
+              const indexStr = remaining.slice(0, dotIdx);
+              const rest = remaining.slice(dotIdx + 1);
+              const index = Number.parseInt(indexStr, 10);
+              let realKey: string;
+              if (rest.startsWith('message.')) {
+                realKey = rest.slice('message.'.length);
+              } else {
+                realKey = rest;
+              }
+              outputMessages[index] = {
+                ...outputMessages[index],
+                [realKey]: value,
+              };
+            }
+          }
+          for (const inputMessage of inputMessages) {
+            if (inputMessage) {
+              traceMessages.push(inputMessage);
+            }
+          }
+          for (const outputMessage of outputMessages) {
+            if (outputMessage) {
+              traceMessages.push(outputMessage);
+            }
+          }
+          messages = traceMessages;
+        }
+
         const message = await chat('evaluate', {
           connectorIdOverride: evaluationConnectorId,
           systemMessage: `You are a critical assistant for evaluating conversations with the Elastic Observability AI Assistant,
